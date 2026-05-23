@@ -1,6 +1,6 @@
 {
   "embedding_model": "bge_m3_embed",
-  "embedding_batch_size": 64,
+  "embedding_batch_size": 128,
   "embedding_dimensions": 1024,
   "file_max_lines": 200,
   "symbol_paths": [],

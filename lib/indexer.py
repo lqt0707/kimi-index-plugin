@@ -35,7 +35,7 @@ def _cosine_similarity(query: np.ndarray, vectors: np.ndarray) -> np.ndarray:
 
 
 class Indexer:
-    """Manages file-level and symbol-level indexes."""
+    """Manages file-level and symbol-level indexes with in-memory vector cache."""
 
     def __init__(self, cwd: str | None = None):
         self.index_dir = _get_index_dir(cwd)
@@ -46,6 +46,9 @@ class Indexer:
         self.meta_path = self.index_dir / META_FILE
         self._conn: sqlite3.Connection | None = None
         self._init_db()
+        # In-memory cache for vectors to avoid repeated disk I/O
+        self._file_vec_cache: np.ndarray | None = None
+        self._symbol_vec_cache: np.ndarray | None = None
 
     def _conn_db(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -88,6 +91,25 @@ class Indexer:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_symbol_name ON symbol_docs(symbol)"
+        )
+        # --- Caller index for fast trace lookups ---
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS caller_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_symbol TEXT NOT NULL,
+                caller_file TEXT NOT NULL,
+                caller_symbol TEXT,
+                line_number INTEGER,
+                UNIQUE(target_symbol, caller_file, caller_symbol)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_caller_target ON caller_index(target_symbol)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_caller_file ON caller_index(caller_file)"
         )
         conn.commit()
 
@@ -175,6 +197,15 @@ class Indexer:
         rows = conn.execute("SELECT id, file FROM file_docs").fetchall()
         return {row["file"]: row["id"] for row in rows}
 
+    def get_all_file_docs_with_mtime(self) -> dict[str, dict]:
+        """Return mapping of file path -> {id, mtime}."""
+        conn = self._conn_db()
+        rows = conn.execute("SELECT id, file, mtime FROM file_docs").fetchall()
+        return {
+            row["file"]: {"id": row["id"], "mtime": row["mtime"] or 0.0}
+            for row in rows
+        }
+
     def get_file_doc(self, doc_id: int) -> dict[str, Any] | None:
         conn = self._conn_db()
         row = conn.execute("SELECT * FROM file_docs WHERE id = ?", (doc_id,)).fetchone()
@@ -231,19 +262,27 @@ class Indexer:
 
     def save_file_vectors(self, vectors: np.ndarray) -> None:
         np.save(self.file_vec_path, vectors)
+        self._file_vec_cache = vectors
 
     def load_file_vectors(self) -> np.ndarray:
+        if self._file_vec_cache is not None:
+            return self._file_vec_cache
         if not self.file_vec_path.exists():
             return np.array([]).reshape(0, 0)
-        return np.load(self.file_vec_path)
+        self._file_vec_cache = np.load(self.file_vec_path)
+        return self._file_vec_cache
 
     def save_symbol_vectors(self, vectors: np.ndarray) -> None:
         np.save(self.symbol_vec_path, vectors)
+        self._symbol_vec_cache = vectors
 
     def load_symbol_vectors(self) -> np.ndarray:
+        if self._symbol_vec_cache is not None:
+            return self._symbol_vec_cache
         if not self.symbol_vec_path.exists():
             return np.array([]).reshape(0, 0)
-        return np.load(self.symbol_vec_path)
+        self._symbol_vec_cache = np.load(self.symbol_vec_path)
+        return self._symbol_vec_cache
 
     # ------------------------------------------------------------------
     # Search
@@ -255,7 +294,7 @@ class Indexer:
         limit: int = 10,
         file_pattern: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search file-level index."""
+        """Search file-level index using vectorized numpy ops."""
         vectors = self.load_file_vectors()
         if vectors.size == 0:
             return []
@@ -267,22 +306,25 @@ class Indexer:
         rows = conn.execute("SELECT id, file, language, line_count, exports, text_preview FROM file_docs").fetchall()
         file_map = {row["id"]: dict(row) for row in rows}
 
-        results = []
-        for idx in range(len(vectors)):
-            doc_id = idx + 1  # SQLite auto-increment starts at 1, and we maintain order
-            if doc_id not in file_map:
-                continue
-            info = file_map[doc_id]
-            if file_pattern and not self._match_pattern(info["file"], file_pattern):
-                continue
-            results.append({
-                "id": doc_id,
-                "score": float(scores[idx]),
-                **info,
-            })
+        # Build aligned arrays for vectorized filtering
+        doc_ids = np.arange(1, len(vectors) + 1)
+        valid_mask = np.array([did in file_map for did in doc_ids])
+        if file_pattern:
+            valid_mask &= np.array([self._match_pattern(file_map[did]["file"], file_pattern) for did in doc_ids])
 
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:limit]
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) == 0:
+            return []
+
+        valid_scores = scores[valid_indices]
+        top_k = min(limit, len(valid_indices))
+        top_idx = valid_indices[np.argpartition(-valid_scores, top_k - 1)[:top_k]]
+        top_idx = top_idx[np.argsort(-scores[top_idx])]
+
+        return [
+            {"id": int(doc_ids[i]), "score": float(scores[i]), **file_map[doc_ids[i]]}
+            for i in top_idx
+        ]
 
     def search_symbols(
         self,
@@ -290,7 +332,7 @@ class Indexer:
         limit: int = 10,
         file_pattern: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search symbol-level index."""
+        """Search symbol-level index using vectorized numpy ops."""
         vectors = self.load_symbol_vectors()
         if vectors.size == 0:
             return []
@@ -304,22 +346,24 @@ class Indexer:
         ).fetchall()
         sym_map = {row["id"]: dict(row) for row in rows}
 
-        results = []
-        for idx in range(len(vectors)):
-            doc_id = idx + 1
-            if doc_id not in sym_map:
-                continue
-            info = sym_map[doc_id]
-            if file_pattern and not self._match_pattern(info["file"], file_pattern):
-                continue
-            results.append({
-                "id": doc_id,
-                "score": float(scores[idx]),
-                **info,
-            })
+        doc_ids = np.arange(1, len(vectors) + 1)
+        valid_mask = np.array([did in sym_map for did in doc_ids])
+        if file_pattern:
+            valid_mask &= np.array([self._match_pattern(sym_map[did]["file"], file_pattern) for did in doc_ids])
 
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:limit]
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) == 0:
+            return []
+
+        valid_scores = scores[valid_indices]
+        top_k = min(limit, len(valid_indices))
+        top_idx = valid_indices[np.argpartition(-valid_scores, top_k - 1)[:top_k]]
+        top_idx = top_idx[np.argsort(-scores[top_idx])]
+
+        return [
+            {"id": int(doc_ids[i]), "score": float(scores[i]), **sym_map[doc_ids[i]]}
+            for i in top_idx
+        ]
 
     def search_combined(
         self,
@@ -392,6 +436,77 @@ class Indexer:
             "db_size_bytes": db_size,
             "vector_size_bytes": vec_size,
         }
+
+    # ------------------------------------------------------------------
+    # Caller / callee index for fast tracing
+    # ------------------------------------------------------------------
+
+    def clear_caller_index(self) -> None:
+        """Clear all caller index entries."""
+        conn = self._conn_db()
+        conn.execute("DELETE FROM caller_index")
+        conn.commit()
+
+    def add_caller_entries(self, entries: list[dict[str, Any]]) -> None:
+        """Batch insert caller index entries."""
+        if not entries:
+            return
+        conn = self._conn_db()
+        for e in entries:
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO caller_index (target_symbol, caller_file, caller_symbol, line_number)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (e["target"], e["caller_file"], e.get("caller_symbol"), e.get("line_number", 0)),
+                )
+            except Exception:
+                pass
+        conn.commit()
+
+    def search_callers(self, symbol: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Fast caller lookup using caller_index table."""
+        conn = self._conn_db()
+        rows = conn.execute(
+            "SELECT DISTINCT caller_file, caller_symbol FROM caller_index WHERE target_symbol = ? LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
+        return [
+            {"file": r["caller_file"], "symbol": r["caller_symbol"] or symbol, "relationship": "caller"}
+            for r in rows
+        ]
+
+    def search_callees(self, symbol: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Fast callee lookup — find symbols this symbol calls."""
+        conn = self._conn_db()
+        # Find the file(s) where this symbol is defined
+        rows = conn.execute(
+            "SELECT file, text FROM symbol_docs WHERE symbol = ? LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
+        if not rows:
+            return []
+
+        # Look up which target symbols have this file as caller
+        callees = []
+        seen = set()
+        for row in rows:
+            caller_file = row["file"]
+            callee_rows = conn.execute(
+                "SELECT DISTINCT target_symbol FROM caller_index WHERE caller_file = ? AND caller_symbol = ? LIMIT ?",
+                (caller_file, symbol, limit),
+            ).fetchall()
+            for cr in callee_rows:
+                key = (caller_file, cr["target_symbol"])
+                if key not in seen:
+                    seen.add(key)
+                    callees.append({
+                        "file": caller_file,
+                        "symbol": cr["target_symbol"],
+                        "relationship": "callee",
+                    })
+        return callees
 
     def close(self) -> None:
         if self._conn:

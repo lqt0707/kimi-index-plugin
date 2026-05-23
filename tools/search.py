@@ -28,6 +28,11 @@ def main() -> None:
     try:
         qvec = embedder.embed_single(query)
 
+        # Preload vectors once for combined search to avoid double I/O
+        if granularity == "auto":
+            file_vecs = indexer.load_file_vectors()
+            sym_vecs = indexer.load_symbol_vectors()
+
         if granularity == "file":
             results = indexer.search_files(qvec, limit=limit, file_pattern=file_pattern)
             output = [

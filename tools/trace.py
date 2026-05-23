@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodeIndexTrace tool — trace symbol callers/callees."""
+"""CodeIndexTrace tool — trace symbol callers/callees using caller_index."""
 
 from __future__ import annotations
 
@@ -12,13 +12,16 @@ sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
 from lib.indexer import Indexer
 
 
-def _find_callers(symbol: str, indexer: Indexer) -> list[dict]:
-    """Find files that reference the given symbol."""
+def _find_callers_fallback(symbol: str, indexer: Indexer) -> list[dict]:
+    """Fallback: SQLite LIKE pre-filter + regex scan."""
     conn = indexer._conn_db()
-    # Get all file text previews
-    rows = conn.execute("SELECT file, text_preview FROM file_docs").fetchall()
+    sym_name = symbol.split(".")[-1]
+    like_pattern = f"%{sym_name}%"
+    rows = conn.execute(
+        "SELECT file, text_preview FROM file_docs WHERE text_preview LIKE ?",
+        (like_pattern,),
+    ).fetchall()
     callers = []
-    sym_name = symbol.split(".")[-1]  # Use short name for matching
     pattern = re.compile(rf"\b{re.escape(sym_name)}\b")
     for row in rows:
         text = row["text_preview"] or ""
@@ -31,10 +34,9 @@ def _find_callers(symbol: str, indexer: Indexer) -> list[dict]:
     return callers
 
 
-def _find_callees(symbol: str, indexer: Indexer) -> list[dict]:
-    """Find symbols called by the given symbol (approximate via file content)."""
+def _find_callees_fallback(symbol: str, indexer: Indexer) -> list[dict]:
+    """Fallback: scan symbol text for function calls."""
     conn = indexer._conn_db()
-    # Find the file containing the symbol
     sym_rows = conn.execute(
         "SELECT file, text FROM symbol_docs WHERE symbol = ?",
         (symbol,),
@@ -43,18 +45,21 @@ def _find_callees(symbol: str, indexer: Indexer) -> list[dict]:
         return []
 
     callees = []
+    seen = set()
+    call_pattern = re.compile(r"\b(\w+)\s*\(")
     for row in sym_rows:
         text = row["text"] or ""
-        # Find function calls in the text
-        call_pattern = re.compile(r"\b(\w+)\s*\(")
         for match in call_pattern.finditer(text):
             called = match.group(1)
             if called not in ("if", "for", "while", "switch", "return", "await", "yield", "new"):
-                callees.append({
-                    "file": row["file"],
-                    "symbol": called,
-                    "relationship": "callee",
-                })
+                key = (row["file"], called)
+                if key not in seen:
+                    seen.add(key)
+                    callees.append({
+                        "file": row["file"],
+                        "symbol": called,
+                        "relationship": "callee",
+                    })
     return callees
 
 
@@ -69,10 +74,19 @@ def main() -> None:
 
     indexer = Indexer()
     try:
+        sym_short = symbol.split(".")[-1]
+
         if direction == "callers":
-            results = _find_callers(symbol, indexer)
+            # Fast path: use caller_index if available
+            results = indexer.search_callers(sym_short, limit=50)
+            if not results:
+                # Fallback to LIKE + regex scan
+                results = _find_callers_fallback(symbol, indexer)
         else:
-            results = _find_callees(symbol, indexer)
+            # Fast path: use caller_index reverse lookup
+            results = indexer.search_callees(sym_short, limit=50)
+            if not results:
+                results = _find_callees_fallback(symbol, indexer)
 
         # Deduplicate
         seen = set()

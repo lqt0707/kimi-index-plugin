@@ -88,37 +88,75 @@ _PATTERNS = [
 
 
 def _extract_symbols(lines: list[str]) -> list[SymbolDoc]:
-    """Extract top-level symbols from code lines."""
-    symbols: list[SymbolDoc] = []
+    """Extract top-level symbols from code lines — O(n) implementation."""
+    n = len(lines)
+
+    # Phase 1: find all symbol start positions and their indents
+    matches: list[tuple[int, str, str, int]] = []
     for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
         for pattern, sym_type in _PATTERNS:
-            match = pattern.match(line)
-            if match:
-                name = match.group(1) if match.lastindex else line.strip()[:40]
-                # Simple heuristic: symbol spans from this line until next top-level construct
-                # or blank line followed by top-level
-                end = i + 1
+            m = pattern.match(line)
+            if m:
+                name = m.group(1) if m.lastindex else stripped[:40]
                 indent = len(line) - len(line.lstrip())
-                for j in range(i + 1, len(lines)):
-                    next_line = lines[j]
-                    if not next_line.strip():
-                        continue
-                    next_indent = len(next_line) - len(next_line.lstrip())
-                    if next_indent <= indent and any(p.match(next_line) for p, _ in _PATTERNS):
-                        end = j
-                        break
-                    end = j + 1
-                text = "\n".join(lines[i:end]).strip()
-                symbols.append(
-                    SymbolDoc(
-                        symbol=name,
-                        symbol_type=sym_type,
-                        line_start=i + 1,
-                        line_end=end,
-                        text=text,
-                    )
-                )
+                matches.append((i, name, sym_type, indent))
                 break
+
+    if not matches:
+        return []
+
+    mcount = len(matches)
+
+    # Phase 2: compute line indents for boundary detection
+    line_indents: list[int] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            line_indents.append(-1)
+        else:
+            line_indents.append(len(line) - len(line.lstrip()))
+
+    # Phase 3: precompute next boundary using monotonic stack (right-to-left)
+    # next_boundary[i] = line index of next symbol start with indent <= matches[i]'s indent
+    # default = n (end of file)
+    next_boundary = [n] * mcount
+    stack: list[tuple[int, int]] = []  # (match_idx, indent)
+
+    for i in range(mcount - 1, -1, -1):
+        _, _, _, indent = matches[i]
+        # Pop symbols with indent >= current (they can't be boundaries)
+        while stack and stack[-1][1] >= indent:
+            stack.pop()
+        if stack:
+            next_boundary[i] = matches[stack[-1][0]][0]
+        stack.append((i, indent))
+
+    # Phase 4: build symbols
+    symbols: list[SymbolDoc] = []
+    for i, (line_idx, name, sym_type, indent) in enumerate(matches):
+        end = next_boundary[i]
+        if end == n:
+            # No next symbol boundary; scan to first non-blank at <= indent
+            for j in range(line_idx + 1, n):
+                li = line_indents[j]
+                if li >= 0 and li <= indent:
+                    end = j
+                    break
+                end = j + 1
+
+        text = "\n".join(lines[line_idx:end]).strip()
+        symbols.append(
+            SymbolDoc(
+                symbol=name,
+                symbol_type=sym_type,
+                line_start=line_idx + 1,
+                line_end=end,
+                text=text,
+            )
+        )
     return symbols
 
 

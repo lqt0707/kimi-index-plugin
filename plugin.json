@@ -10,7 +10,7 @@
   "tools": [
     {
       "name": "CodeIndexSearch",
-      "description": "Semantic code search using natural language. Returns the most relevant files and symbols in the codebase. Use this BEFORE ReadFile when you need to understand or locate code. For exact string matching (config values, exact filenames), use the built-in Grep instead.",
+      "description": "Semantic code search using natural language. Returns the most relevant files and symbols in the codebase. Use this when the user wants to find files, search code, lookup implementations, locate anything code-related, or discover relevant source files. Use this BEFORE ReadFile, Glob, or Grep when the query is about code content, functionality, or architecture. For exact string matching (config values, exact filenames), use the built-in Grep instead.",
       "command": ["./.venv/bin/python3", "tools/search.py"],
       "parameters": {
         "type": "object",
