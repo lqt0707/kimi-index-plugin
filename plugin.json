@@ -1,0 +1,119 @@
+{
+  "name": "kimi-index-plugin",
+  "version": "0.2.0",
+  "description": "Kimi CLI native code indexing plugin with semantic search, symbol tracing, and automatic incremental updates via file watcher.",
+  "config_file": "config.json",
+  "inject": {
+    "KIMI_INDEX_API_KEY": "api_key",
+    "KIMI_INDEX_BASE_URL": "base_url"
+  },
+  "tools": [
+    {
+      "name": "CodeIndexSearch",
+      "description": "Semantic code search using natural language. Returns the most relevant files and symbols in the codebase. Use this BEFORE ReadFile when you need to understand or locate code. For exact string matching (config values, exact filenames), use the built-in Grep instead.",
+      "command": ["./.venv/bin/python3", "tools/search.py"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Natural language query describing the code you are looking for. Be specific about functionality, e.g. 'user authentication logic', 'order status machine', 'JWT token refresh handler'."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum number of results to return. Default: 10.",
+            "default": 10
+          },
+          "granularity": {
+            "type": "string",
+            "enum": ["auto", "file", "symbol"],
+            "description": "Search granularity. 'auto' = file-level first then symbol-level within top files. 'file' = file-level only. 'symbol' = symbol-level only. Default: auto.",
+            "default": "auto"
+          },
+          "file_pattern": {
+            "type": ["string", "null"],
+            "description": "Optional glob pattern to filter files, e.g. 'src/lib/**/*.ts', '*.py'. Null means no filter.",
+            "default": null
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "CodeIndexStatus",
+      "description": "Check the status of the code index for the current project. Shows file count, symbol count, last update time, embedding model used, and whether the background watcher is running.",
+      "command": ["./.venv/bin/python3", "tools/status.py"],
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "CodeIndexBuild",
+      "description": "Build or update the code index. First call performs a full build; subsequent calls incrementally update changed files. For large projects, this may take a few minutes. Progress is reported to stderr. If the index does not exist yet, you MUST call this tool first before using CodeIndexSearch.",
+      "command": ["./.venv/bin/python3", "tools/build.py"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "force_rebuild": {
+            "type": "boolean",
+            "description": "If true, delete existing index and rebuild from scratch. Default: false.",
+            "default": false
+          },
+          "paths": {
+            "type": ["array", "null"],
+            "items": { "type": "string" },
+            "description": "Optional list of paths to index. Null means index the entire project. Example: ['src/lib', 'src/utils'].",
+            "default": null
+          },
+          "symbol_paths": {
+            "type": ["array", "null"],
+            "items": { "type": "string" },
+            "description": "Optional list of paths to additionally index at symbol-level (functions, classes, interfaces). Useful for core libraries. Example: ['src/lib', 'src/hooks'].",
+            "default": null
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "CodeIndexTrace",
+      "description": "Trace the caller or callee chain of a symbol (function, class, method). Helps understand how code is connected across files.",
+      "command": ["./.venv/bin/python3", "tools/trace.py"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "The symbol name to trace, e.g. 'UserService.login', 'handleSubmit', 'validateToken'."
+          },
+          "direction": {
+            "type": "string",
+            "enum": ["callers", "callees"],
+            "description": "Trace direction. 'callers' = who calls this symbol. 'callees' = what this symbol calls. Default: callers.",
+            "default": "callers"
+          }
+        },
+        "required": ["symbol"]
+      }
+    },
+    {
+      "name": "CodeIndexWatch",
+      "description": "Start or stop the background file watcher. The watcher monitors source files for changes and automatically updates the index incrementally. For fully automated indexing, start the watcher after the initial build.",
+      "command": ["./.venv/bin/python3", "tools/watch.py"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["start", "stop", "status"],
+            "description": "Action to perform. 'start' = start background watcher. 'stop' = stop watcher. 'status' = check if watcher is running. Default: status.",
+            "default": "status"
+          }
+        },
+        "required": []
+      }
+    }
+  ]
+}
